@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use artcraft_launcher_core::protocol::{CANCELLED, INSTALL_CANCELLED, InstallLocations, JobPhase};
 use artcraft_launcher_core::release::{self, Asset, Release};
-use artcraft_launcher_core::{CraftApp, InstallSource, Installed, PackageKind};
+use artcraft_launcher_core::{CraftApp, InstallSource, Installed, PackageKind, version};
 
 use crate::http::{Http, Stop, Transfer};
 use crate::manifest::Record;
@@ -80,6 +80,13 @@ pub fn install_at(
         && process::is_running(Path::new(&inst.location))
     {
         return Err(format!("{} is running. Quit it, then try again.", app.name));
+    }
+    if !job.replace
+        && let Some(inst) = existing
+        && let (Some(rel_v), Some(inst_v)) = (release.version.as_ref(), inst.version.as_ref())
+        && version::is_newer(inst_v, rel_v)
+    {
+        return Err(format!("Cannot update {} to {}: installed version {} is newer", app.name, release.version_label(), inst_v));
     }
     log::info!("{}: starting {} to {} ({})", app.name, if existing.is_some() { "update" } else { "install" }, release.version_label(), kind.label());
     let file = download(release, asset, job)?;
@@ -2004,6 +2011,29 @@ mod tests {
         #[cfg(target_os = "linux")]
         assert_eq!(choose_kinds(Some(&inst(InstallSource::AppImage)), None, &[]), [PackageKind::AppImage]);
         let _ = inst;
+    }
+
+    #[test]
+    fn install_refuses_to_downgrade_when_target_release_is_older() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let http = Http::new().unwrap();
+        let phase = &mut |_| ();
+        let locations = InstallLocations::default();
+        let app = CraftApp::by_id("photocraft").unwrap();
+        let release = Release { version: version::parse("0.4.0"), tag: "v0.4.0".into(), ..Release::default() };
+        let asset = Asset { name: "photocraft-0.4.0-linux-x86_64.AppImage".into(), ..Asset::default() };
+        let installed = Installed {
+            version: version::parse("0.5.0"),
+            source: InstallSource::Launcher,
+            location: dir.path().join("PhotoCraft.AppImage").display().to_string(),
+            package: None,
+        };
+        let stop = Stop::default();
+        let mut job = Job { http: &http, paths: &paths, stop: &stop, phase, install_locations: &locations, replace: false };
+        let result = install_at(app, &release, &asset, PackageKind::AppImage, Some(&installed), None, &mut job, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("installed version 0.5.0 is newer"));
     }
 
     #[cfg(target_os = "linux")]

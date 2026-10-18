@@ -211,6 +211,11 @@ pub fn update(
     phase: &mut dyn FnMut(JobPhase),
     last: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), String> {
+    if let (Some(rel_v), Some(cur_v)) = (release.version.as_ref(), current_version().as_ref())
+        && !version::is_newer(rel_v, cur_v)
+    {
+        return Err(format!("ArtCraft Launcher {} is not newer than currently running version {}", release.version_label(), cur_v));
+    }
     let (asset, _) = pick_asset(release, &[LAUNCHER.id], platform, &[install.kind()])
         .ok_or_else(|| format!("ArtCraft Launcher {} has no {} for {}", release.version_label(), install.kind().label(), platform.label()))?;
     let asset = asset.clone();
@@ -538,6 +543,33 @@ mod tests {
         assert_eq!(pick(Os::Linux, Install::AppImage(PathBuf::new()).kind()).as_deref(), Some(names[3]));
         assert_eq!(pick(Os::Linux, Install::Package(PackageKind::Deb, PathBuf::new()).kind()).as_deref(), Some(names[4]));
         assert_eq!(pick(Os::Linux, Install::Flatpak.kind()).as_deref(), Some(names[5]));
+    }
+
+    #[test]
+    fn update_refuses_to_downgrade_when_release_is_older() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let http = Http::new().unwrap();
+        let mut phase = |_| ();
+        let last = || Ok(());
+        let stop = Stop::default();
+        let release = Release {
+            version: version::parse("0.1.0"),
+            tag: "v0.1.0".into(),
+            assets: vec![artcraft_launcher_core::release::Asset {
+                name: "artcraft-launcher-0.1.0-linux-x86_64.AppImage".into(),
+                size: 1,
+                url: String::new(),
+                sha256: None,
+            }],
+            ..Release::default()
+        };
+        let install = Install::AppImage(dir.path().join("launcher.AppImage"));
+        use artcraft_launcher_core::{Arch, Os};
+        let platform = Platform { os: Os::Linux, arch: Arch::X64 };
+        let result = update(&install, &release, platform, &http, &paths, &stop, &mut phase, &last);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("is not newer than currently running version"));
     }
 
     #[cfg(target_os = "linux")]
