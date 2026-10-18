@@ -132,18 +132,11 @@ fn msi_install_dir() -> Option<PathBuf> {
 #[cfg(target_os = "linux")]
 fn detect(exe: &Path) -> Option<Install> {
     if process::in_sandbox() {
-        // Only allow self-update for user-level bundle installs. A Flathub or system-wide install
-        // should be updated via its origin (Flathub / the system package manager); running
-        // `flatpak install --user --reinstall --bundle` on such an install would create a second,
-        // user-level copy alongside the original.
-        //
-        // Distinguish the two by inspecting `app-path` in `/.flatpak-info`: a user bundle install
-        // is placed under the user's home Flatpak directory (`~/.local/share/flatpak`), whereas a
-        // Flathub or system-wide install lives under `/var/lib/flatpak` or `/run/host`.
-        if is_user_bundle_install() && process::is_flatpak_available() {
-            return Some(Install::Flatpak);
-        }
-        return None;
+        // Only the release bundle installed per user updates itself, with `flatpak install --user
+        // --reinstall --bundle`. A system-wide copy would gain a second, per-user one beside it;
+        // a copy from a repository is that repository's to update (and an unsigned bundle can't
+        // go into a signed one).
+        return (is_user_install() && from_bundle()).then_some(Install::Flatpak);
     }
     if let Some(appimage) = std::env::var_os("APPIMAGE") {
         return Some(Install::AppImage(PathBuf::from(appimage)));
@@ -161,53 +154,42 @@ fn detect(exe: &Path) -> Option<Install> {
     None
 }
 
-/// Returns `true` when `/.flatpak-info` indicates a user-level bundle install.
-///
-/// A user bundle install places the app under the user's personal Flatpak data directory
-/// (`~/.local/share/flatpak`).  Flathub and system-wide installs use `/var/lib/flatpak` or
-/// expose the app path under `/run/host`.  We check the `app-path` key in the `[Instance]`
-/// section; if the file is absent or malformed we conservatively return `false`.
+/// Whether this sandbox runs the per-user installation's copy, from `app-path` in `/.flatpak-info`.
 #[cfg(target_os = "linux")]
-fn is_user_bundle_install() -> bool {
-    let info = match std::fs::read_to_string("/.flatpak-info") {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    parse_is_user_bundle(&info)
+fn is_user_install() -> bool {
+    std::fs::read_to_string("/.flatpak-info").is_ok_and(|info| parse_is_user_install(&info))
 }
 
-/// Pure-function core of [`is_user_bundle_install`], split out for unit-testing.
 #[cfg(target_os = "linux")]
-fn parse_is_user_bundle(info: &str) -> bool {
-    // Look for `app-path=…` in the [Instance] section.
+fn parse_is_user_install(info: &str) -> bool {
     let mut in_instance = false;
     for line in info.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_instance = trimmed == "[Instance]";
-            continue;
-        }
-        if !in_instance {
-            continue;
-        }
-        if let Some(path) = trimmed.strip_prefix("app-path=") {
-            // User bundle installs are placed under the user's local share directory
-            // (`~/.local/share/flatpak`). Flathub / system installs use `/var/lib/flatpak`
-            // or are exposed under `/run/host`.
-            let p = path.trim();
-            if p.is_empty() || p.starts_with("/var/lib/flatpak") || p.starts_with("/run/host") {
-                return false;
-            }
-            let user_base = dirs::data_local_dir().or_else(|| dirs::home_dir().map(|h| h.join(".local/share"))).map(|d| d.join("flatpak"));
-            if let Some(base) = user_base
-                && p.starts_with(base.to_string_lossy().as_ref())
-            {
-                return true;
-            }
-            return p.contains("/.local/share/flatpak");
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_instance = line == "[Instance]";
+        } else if in_instance && let Some(path) = line.strip_prefix("app-path=") {
+            // The host's path. The per-user installation is ~/.local/share/flatpak there; it can't
+            // be looked up from in here, where XDG_DATA_HOME points into ~/.var/app instead.
+            return path.trim().contains("/.local/share/flatpak/");
         }
     }
     false
+}
+
+/// Whether the per-user copy was installed from a `.flatpak` bundle. `/.flatpak-info` doesn't say
+/// where it came from, so the host's Flatpak is asked.
+#[cfg(target_os = "linux")]
+fn from_bundle() -> bool {
+    let id = LAUNCHER.bundle_id();
+    process::capture_flatpak(&["info", "--user", "--show-origin", &id], std::time::Duration::from_secs(3))
+        .is_some_and(|origin| is_bundle_origin(origin.trim()))
+}
+
+/// Flatpak names a bundle's origin after the last part of the app id, numbered when that name is
+/// taken: `artcraft-launcher-origin`, `artcraft-launcher1-origin`, …
+#[cfg(target_os = "linux")]
+fn is_bundle_origin(origin: &str) -> bool {
+    origin.strip_prefix(LAUNCHER.id).and_then(|rest| rest.strip_suffix("-origin")).is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
@@ -395,7 +377,8 @@ fn relaunch_flatpak_after_exit() -> Result<(), String> {
             r#"id=$1; shift; i=0; while flatpak ps --columns=instance 2>/dev/null | grep -q "^$id$"; do [ $i -ge 600 ] && exit 1; sleep 0.1; i=$((i+1)); done; exec "$@""#,
             id,
         ),
-        (None, None) => (r#"shift; sleep 1; exec "$@""#, String::new()),
+        // Without either, starting it again could only meet the old copy still running.
+        (None, None) => return Err("ArtCraft Launcher is updated; quit and reopen it to start the new version".into()),
     };
     let script = format!("({wait_clause}) &");
     let app_id = LAUNCHER.bundle_id();
@@ -569,28 +552,31 @@ mod tests {
         assert_eq!(parse_flatpak_host_pid(ps, "999999999"), None);
     }
 
-    /// Only a user-bundle install (app-path under ~/.local/share/flatpak) should be self-updated;
-    /// Flathub / system-wide installs (/var/lib/flatpak) must be left to their origin.
+    /// Only the per-user installation's copy updates itself; a system-wide one is left alone.
     #[cfg(target_os = "linux")]
     #[test]
-    fn detects_user_bundle_install_from_flatpak_info() {
-        // Typical user bundle install: app-path under ~/.local/share/flatpak.
-        let user_bundle = "[Application]\nname=ai.storyteller.artcraft-launcher\n\n[Instance]\napp-path=/home/alice/.local/share/flatpak/app/ai.storyteller.artcraft-launcher/current/active\n";
-        assert!(parse_is_user_bundle(user_bundle), "user bundle should be updatable");
+    fn only_a_per_user_install_updates_itself() {
+        let info = |path: &str| format!("[Application]\nname=ai.storyteller.artcraft-launcher\n\n[Instance]\ninstance-id=1\napp-path={path}\n");
+        assert!(parse_is_user_install(&info("/home/alice/.local/share/flatpak/app/ai.storyteller.artcraft-launcher/x86_64/stable/0a3de1c/files")));
+        assert!(!parse_is_user_install(&info("/var/lib/flatpak/app/ai.storyteller.artcraft-launcher/x86_64/stable/0a3de1c/files")));
+        // `flatpak run --app-path=` mounts an empty /app.
+        assert!(!parse_is_user_install(&info("")));
+        // The key belongs to [Instance] only.
+        assert!(!parse_is_user_install("[Application]\napp-path=/home/alice/.local/share/flatpak/app/x/files\n"));
+        assert!(!parse_is_user_install("[Instance]\ninstance-id=123\n"));
+        assert!(!parse_is_user_install(""));
+    }
 
-        // Flathub / system-wide install: app-path under /var/lib/flatpak.
-        let system = "[Application]\nname=ai.storyteller.artcraft-launcher\n\n[Instance]\napp-path=/var/lib/flatpak/app/ai.storyteller.artcraft-launcher/current/active\n";
-        assert!(!parse_is_user_bundle(system), "system install should NOT be self-updated");
-
-        // Exposed under /run/host (another system-install pattern).
-        let run_host = "[Application]\nname=ai.storyteller.artcraft-launcher\n\n[Instance]\napp-path=/run/host/var/lib/flatpak/app/ai.storyteller.artcraft-launcher/current/active\n";
-        assert!(!parse_is_user_bundle(run_host), "/run/host path should NOT be self-updated");
-
-        // No app-path at all (incomplete metadata).
-        let no_path = "[Application]\nname=ai.storyteller.artcraft-launcher\n\n[Instance]\ninstance-id=123\n";
-        assert!(!parse_is_user_bundle(no_path), "missing app-path should not be self-updated");
-
-        // Empty / garbage.
-        assert!(!parse_is_user_bundle(""));
+    /// A copy from a repository (Flathub or any other) isn't the bundle's to replace.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_a_bundle_origin_counts_as_the_release_bundle() {
+        assert!(is_bundle_origin("artcraft-launcher-origin"));
+        assert!(is_bundle_origin("artcraft-launcher2-origin"));
+        assert!(!is_bundle_origin("flathub"));
+        assert!(!is_bundle_origin("flathub-beta"));
+        assert!(!is_bundle_origin("artcraft-launcher-beta-origin"));
+        assert!(!is_bundle_origin("photocraft-origin"));
+        assert!(!is_bundle_origin(""));
     }
 }

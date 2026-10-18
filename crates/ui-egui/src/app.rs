@@ -434,6 +434,8 @@ impl LauncherUi {
                 true
             }
             Event::LauncherUpdate(r) => {
+                // Whether the launcher can replace itself is only known once an update is found.
+                self.caps = self.backend.capabilities();
                 let fresh = self.launcher_update.as_ref().is_none_or(|cur| cur.version != r.version);
                 self.launcher_update = Some(r.clone());
                 // Ask once per new version, unless automatic updates will install it anyway.
